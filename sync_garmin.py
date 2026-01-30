@@ -62,7 +62,7 @@ def main():
     # Get recent activities (last 7 days)
     print("Fetching recent activities...")
     try:
-        activities = garmin.get_activities(0, 20)  # Get last 20 activities
+        activities = garmin.get_activities(0, 100)  # Get last 20 activities
         print(f"Found {len(activities)} total activities")
     except Exception as e:
         print(f"❌ Failed to fetch activities: {e}")
