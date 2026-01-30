@@ -4,22 +4,29 @@ from garminconnect import Garmin
 from google.oauth2.service_account import Credentials
 import gspread
 
-def format_duration(seconds):
-    return round(seconds / 60, 2) if seconds else 0
+# 新增：精準轉換秒數為 MM:SS 或 HH:MM:SS
+def format_to_time_string(seconds):
+    if not seconds: return "0:00"
+    seconds = int(round(seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h}:{m:02d}:{s:02d}" if h > 0 else f"{m}:{s:02d}"
 
-def format_pace(distance_meters, duration_seconds):
-    if not distance_meters or not duration_seconds: return 0
-    pace_seconds = duration_seconds / (distance_meters / 1000)
-    return round(pace_seconds / 60, 2)
+# 新增：精準計算配速並轉為 MM:SS
+def format_pace_string(distance_meters, duration_seconds):
+    if not distance_meters or not duration_seconds: return "0:00"
+    pace_seconds = int(round(duration_seconds / (distance_meters / 1000)))
+    return f"{pace_seconds // 60}:{pace_seconds % 60:02d}"
 
 def main():
-    print("🚀 Starting Professional Garmin Sync...")
+    print("🚀 Starting Definitive Fix Sync...")
     garmin_email, garmin_password = os.environ.get('GARMIN_EMAIL'), os.environ.get('GARMIN_PASSWORD')
     google_creds_json, sheet_id = os.environ.get('GOOGLE_CREDENTIALS'), os.environ.get('SHEET_ID')
     
     garmin = Garmin(garmin_email, garmin_password)
     garmin.login()
-    activities = garmin.get_activities(0, 50)
+    activities = garmin.get_activities(0, 100)
     
     creds = Credentials.from_service_account_info(json.loads(google_creds_json),
         scopes=['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive'])
@@ -33,36 +40,35 @@ def main():
         date = activity.get('startTimeLocal', '')[:10]
         if date in existing_dates: continue
             
-        # --- 精準提取進階數據 ---
         dist_m = activity.get('distance', 0)
         dur_s = activity.get('duration', 0)
         
-        # 1. 訓練效果 (修正 4.19999 問題)
-        a_te = round(activity.get('aerobicTrainingEffect', 0), 1)
-        an_te = round(activity.get('anaerobicTrainingEffect', 0), 1)
+        # --- 進階指標暴力偵測 (解決 0 的問題) ---
+        # 步幅 (mm/cm 換算)
+        s_len = activity.get('avgStepLength') or activity.get('averageStepLength') or 0
+        s_len = round(s_len / 100, 2) if s_len > 10 else round(s_len, 2)
         
-        # 2. 步幅 (處理 mm, cm, m 單位差異)
-        # 優先找網頁看到的 0.98m 欄位
-        raw_step = activity.get('avgStepLength') or activity.get('averageStepLength') or 0
-        step_len = round(raw_step / 100, 2) if raw_step > 10 else round(raw_step, 2)
-
-        # 3. 功率 (嘗試不同 Key 路徑)
-        pwr = activity.get('avgRunningPower') or activity.get('averageRunningPower') or 0
-        
-        # 4. 溫度
+        # 功率與溫度 (嘗試多重 Key)
+        pwr = activity.get('avgRunningPower') or activity.get('averageRunningPower') or activity.get('avgPower') or 0
         temp = activity.get('avgTemperature') or activity.get('averageTemperature') or 0
 
         row = [
-            date, activity.get('activityName', 'Run'), round(dist_m/1000, 2), format_duration(dur_s), 
-            format_pace(dist_m, dur_s), activity.get('averageHR', 0) or 0, activity.get('maxHR', 0) or 0,
-            activity.get('calories', 0) or 0, round(activity.get('averageRunningCadenceInStepsPerMinute', 0), 0),
-            round(activity.get('elevationGain', 0), 1), activity.get('activityType', {}).get('typeKey', 'run'),
-            a_te, an_te, step_len, pwr, temp
+            date, 
+            activity.get('activityName', 'Run'), 
+            round(dist_m/1000, 2), 
+            format_to_time_string(dur_s),    # 修正：轉為 55:16 格式
+            format_pace_string(dist_m, dur_s), # 修正：轉為 5:31 格式
+            activity.get('averageHR', 0) or 0, 
+            activity.get('maxHR', 0) or 0,
+            activity.get('calories', 0) or 0, 
+            round(activity.get('averageRunningCadenceInStepsPerMinute', 0), 0),
+            int(activity.get('elevationGain', 0) or 0), # 修正：整數呈現
+            activity.get('activityType', {}).get('typeKey', 'run'),
+            round(activity.get('aerobicTrainingEffect', 0), 1),
+            round(activity.get('anaerobicTrainingEffect', 0), 1),
+            s_len, pwr, temp
         ]
-        
-        sheet.insert_row(row, 2) # 最新置頂
-        print(f"✅ 同步成功: {date} (功率: {pwr}W, 步幅: {step_len}m)")
-
-    print("✨ Sync Complete!")
+        sheet.insert_row(row, 2)
+        print(f"✅ 同步成功: {date}")
 
 if __name__ == "__main__": main()
