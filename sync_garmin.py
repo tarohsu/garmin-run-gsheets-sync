@@ -1,79 +1,96 @@
 import os
+import json
 from garminconnect import Garmin
+from google.oauth2.service_account import Credentials
+import gspread
+
+def format_to_time_string(seconds):
+    if not seconds: return "0:00"
+    seconds = int(round(seconds))
+    m, s = seconds // 60, seconds % 60
+    return f"{m}:{s:02d}"
+
+def format_pace_string(distance_meters, duration_seconds):
+    if not distance_meters or not duration_seconds: return "0:00"
+    pace_seconds = int(round(duration_seconds / (distance_meters / 1000)))
+    return f"{pace_seconds // 60}:{pace_seconds % 60:02d}"
 
 def main():
-    print("🔬 Starting Garmin Deep Diagnosis...")
+    print("🚀 Running Ultimate Full-Metrics Sync...")
+    garmin_email, garmin_password = os.environ.get('GARMIN_EMAIL'), os.environ.get('GARMIN_PASSWORD')
+    google_creds_json, sheet_id = os.environ.get('GOOGLE_CREDENTIALS'), os.environ.get('SHEET_ID')
     
-    # 讀取環境變數
-    email = os.environ.get('GARMIN_EMAIL')
-    password = os.environ.get('GARMIN_PASSWORD')
+    garmin = Garmin(garmin_email, garmin_password)
+    garmin.login()
+    activities = garmin.get_activities(0, 50)
     
-    if not email or not password:
-        print("❌ 缺少帳號密碼，請檢查 Secrets")
-        return
-
-    try:
-        # 1. 登入
-        print(f"🔐 Logging in as {email}...")
-        garmin = Garmin(email, password)
-        garmin.login()
-        
-        # 2. 抓取最近 5 筆活動
-        print("📡 Fetching recent activities...")
-        activities = garmin.get_activities(0, 5)
-        
-        # 3. 尋找那場 "Tempo" 跑 (或任何有跑步數據的活動)
-        target_activity = None
-        for a in activities:
-            if a.get('activityType', {}).get('typeKey') == 'running':
-                # 優先找有功率或步幅數據的活動
-                print(f"   Check: {a['activityName']} ({a['startTimeLocal']})")
-                target_activity = a
-                break
-        
-        if not target_activity:
-            print("❌ 找不到跑步活動")
-            return
-
-        print(f"\n🎯 鎖定目標活動: {target_activity['activityName']} (ID: {target_activity['activityId']})")
-        
-        # 4. 印出 Summary 裡面的關鍵字 (確認是否真的為 0)
-        print("\n--- [Level 1] Summary Data Check ---")
-        for k, v in target_activity.items():
-            if any(x in k.lower() for x in ['step', 'power', 'temp', 'len']):
-                print(f"   {k}: {v}")
-
-        # 5. 重頭戲：抓取 Detail (深層數據)
-        print(f"\n--- [Level 2] Fetching Full Details (ID: {target_activity['activityId']}) ---")
-        try:
-            # 這是 Garmin 存放高階數據的地方
-            full_data = garmin.get_activity(target_activity['activityId'])
+    creds = Credentials.from_service_account_info(json.loads(google_creds_json),
+        scopes=['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive'])
+    client = gspread.authorize(creds)
+    sheet = client.open("Garmin Data").worksheet("Garmin Data")
+    
+    existing_dates = {row[0] for row in sheet.get_all_values()[1:] if row}
+    running_activities = [a for a in activities if a.get('activityType', {}).get('typeKey', '').lower() in ['running', 'treadmill_running', 'trail_running']]
+    
+    rows_to_insert = []
+    
+    for activity in running_activities:
+        date = activity.get('startTimeLocal', '')[:10]
+        if date in existing_dates: continue
             
-            # 搜尋深層數據
-            print("✅ Detail Fetch Success! Searching for hidden metrics...")
-            found_metrics = []
-            
-            # 遞迴搜尋所有欄位
-            def search_dict(d, path=""):
-                for k, v in d.items():
-                    current_path = f"{path}.{k}" if path else k
-                    # 關鍵字過濾
-                    if any(x in k.lower() for x in ['step', 'power', 'temp', 'run']):
-                         print(f"   FOUND: {current_path} = {v}")
-                    
-                    if isinstance(v, dict):
-                        search_dict(v, current_path)
-                    elif isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
-                        # 只看列表的第一個項目，避免洗版
-                        search_dict(v[0], f"{current_path}[0]")
+        dist_m = activity.get('distance', 0)
+        dur_s = activity.get('duration', 0)
+        
+        # --- [Phase 1] 核心數據 ---
+        stride_cm = activity.get('avgStrideLength', 0)
+        step_m = round(stride_cm / 100, 2) if stride_cm > 0 else 0
+        pwr = int(activity.get('avgPower', 0))
+        norm_pwr = int(activity.get('normPower', 0))
+        temp = activity.get('avgTemperature') or activity.get('minTemperature') or 0
+        steps = activity.get('steps', 0)
 
-            search_dict(full_data)
-            
-        except Exception as e:
-            print(f"❌ 無法抓取詳細資料: {e}")
+        # --- [Phase 2] 新增技術指標 (Run Dynamics) ---
+        
+        # 1. GCT (觸地時間) - 單位通常是 ms
+        gct = activity.get('avgGroundContactTime') or 0
+        
+        # 2. 垂直振幅 (Vertical Oscillation) - 單位通常是 cm
+        # API 有時給 mm (如 78), 有時給 cm (如 7.8)
+        vo_raw = activity.get('avgVerticalOscillation') or 0
+        vo_cm = round(vo_raw / 10, 1) if vo_raw > 20 else round(vo_raw, 1)
+        
+        # 3. 最大功率
+        max_pwr = int(activity.get('maxPower', 0))
 
-    except Exception as e:
-        print(f"❌ 發生錯誤: {e}")
+        row = [
+            date,                                       # A
+            activity.get('activityName', 'Run'),        # B
+            round(dist_m / 1000, 2),                    # C: Distance
+            format_to_time_string(dur_s),               # D: Duration
+            format_pace_string(dist_m, dur_s),          # E: Pace
+            activity.get('averageHR', 0) or 0,          # F: Avg HR
+            activity.get('maxHR', 0) or 0,              # G: Max HR
+            activity.get('calories', 0) or 0,           # H: Calories
+            round(activity.get('averageRunningCadenceInStepsPerMinute', 0), 0), # I: Cadence
+            int(activity.get('elevationGain', 0) or 0), # J: Elev
+            activity.get('activityType', {}).get('typeKey', 'run'), # K: Type
+            round(activity.get('aerobicTrainingEffect', 0), 1),     # L: Aerobic
+            round(activity.get('anaerobicTrainingEffect', 0), 1),   # M: Anaerobic
+            step_m,                                     # N: Step Length
+            pwr,                                        # O: Avg Power
+            temp,                                       # P: Temp
+            norm_pwr,                                   # Q: NP
+            steps,                                      # R: Steps
+            gct,                                        # S: GCT (ms) [新增!]
+            vo_cm,                                      # T: Vert Osc (cm) [新增!]
+            max_pwr                                     # U: Max Power [新增!]
+        ]
+        rows_to_insert.append(row)
 
-if __name__ == "__main__":
-    main()
+    if rows_to_insert:
+        sheet.insert_rows(rows_to_insert, 2)
+        print(f"✅ 成功同步 {len(rows_to_insert)} 筆資料 (含 GCT/VO/MaxPower)")
+    else:
+        print("✓ 資料已是最新")
+
+if __name__ == "__main__": main()
