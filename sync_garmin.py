@@ -16,13 +16,13 @@ def format_pace_string(distance_meters, duration_seconds):
     return f"{pace_seconds // 60}:{pace_seconds % 60:02d}"
 
 def main():
-    print("🚀 Running Customized Layout Sync...")
+    print("🚀 Running Final Fixed Sync (Vertical Ratio)...")
     garmin_email, garmin_password = os.environ.get('GARMIN_EMAIL'), os.environ.get('GARMIN_PASSWORD')
     google_creds_json, sheet_id = os.environ.get('GOOGLE_CREDENTIALS'), os.environ.get('SHEET_ID')
     
     garmin = Garmin(garmin_email, garmin_password)
     garmin.login()
-    activities = garmin.get_activities(0, 50) # 抓最近 50 筆
+    activities = garmin.get_activities(0, 50)
     
     creds = Credentials.from_service_account_info(json.loads(google_creds_json),
         scopes=['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive'])
@@ -38,70 +38,68 @@ def main():
         date = activity.get('startTimeLocal', '')[:10]
         if date in existing_dates: continue
             
-        # --- 基礎數據 ---
         dist_m = activity.get('distance', 0)
         dur_s = activity.get('duration', 0)
         
-        # --- 進階數據處理 ---
+        # --- 進階指標 ---
         
-        # 1. 步幅 (Step Length)
+        # 1. 步幅 (cm -> m)
         stride_raw = activity.get('avgStrideLength') or activity.get('averageStepLength') or 0
-        # 邏輯：如果是 98.12 (cm) -> 除以100; 如果是 0.98 (m) -> 不動
         step_m = round(stride_raw / 100, 2) if stride_raw > 10 else round(stride_raw, 2)
         
-        # 2. 功率系列 (Power)
+        # 2. 垂直振幅 (mm -> cm)
+        vo_raw = activity.get('avgVerticalOscillation') or 0
+        vo_cm = round(vo_raw / 10, 1) if vo_raw > 20 else round(vo_raw, 1)
+        
+        # 3. 移動效率 (即 Vertical Ratio 垂直比例)
+        # 優先抓取原廠數據
+        vr = activity.get('avgVerticalRatio') or 0
+        # 雙重保險：如果原廠是 0，手動計算 (VO / Stride)
+        if vr == 0 and stride_raw > 0 and vo_raw > 0:
+            # 確保單位統一為 mm 進行計算 (stride_raw 通常是 cm, vo_raw 通常是 mm)
+            stride_mm = stride_raw * 10
+            vr = (vo_raw / stride_mm) * 100
+        
+        move_eff = round(vr, 1)
+        
+        # 4. GCT (ms)
+        gct = round(activity.get('avgGroundContactTime') or 0, 1)
+        
+        # 5. 功率系列
         pwr_avg = int(activity.get('avgPower', 0) or activity.get('avgRunningPower', 0) or 0)
         pwr_max = int(activity.get('maxPower', 0) or 0)
         pwr_norm = int(activity.get('normPower', 0) or 0)
         
-        # 3. 跑姿系列 (Run Dynamics)
-        # GCT: 修復浮點數 (244.10006 -> 244.1)
-        gct_raw = activity.get('avgGroundContactTime') or 0
-        gct = round(gct_raw, 1)
-        
-        # 垂直振幅
-        vo_raw = activity.get('avgVerticalOscillation') or 0
-        vo_cm = round(vo_raw / 10, 1) if vo_raw > 20 else round(vo_raw, 1)
-        
-        # 移動效率 (Move Efficiency)
-        # 嘗試抓取 'avgRunningCoefficient' 或 'runningEfficiency'
-        eff_raw = (activity.get('avgRunningCoefficient') or 
-                   activity.get('avgRunningEfficiency') or 
-                   activity.get('avgRunningEffectiveness') or 0)
-        move_eff = round(eff_raw, 1)
-
-        # 4. 其他
         steps = activity.get('steps', 0)
 
-        # --- 依照你的指定順序排列 (共 21 欄) ---
         row = [
-            date,                                       # 1. Date
-            activity.get('activityName', 'Run'),        # 2. Activity Name
-            round(dist_m / 1000, 2),                    # 3. Distance (km)
-            format_to_time_string(dur_s),               # 4. Duration (min) - 這裡顯示為 MM:SS
-            format_pace_string(dist_m, dur_s),          # 5. Avg Pace (min/km)
-            activity.get('averageHR', 0) or 0,          # 6. Avg HR
-            activity.get('maxHR', 0) or 0,              # 7. Max HR
-            activity.get('calories', 0) or 0,           # 8. Calories
-            round(activity.get('averageRunningCadenceInStepsPerMinute', 0), 0), # 9. Avg Cadence
-            round(activity.get('aerobicTrainingEffect', 0), 1),     # 10. Aerobic TE
-            round(activity.get('anaerobicTrainingEffect', 0), 1),   # 11. Anaerobic TE
-            int(activity.get('elevationGain', 0) or 0), # 12. Elevation Gain (m)
-            pwr_avg,                                    # 13. Avg Power (W)
-            pwr_max,                                    # 14. Max Power (W)
-            pwr_norm,                                   # 15. Norm Power (NP)
-            step_m,                                     # 16. Avg Step Length (m)
-            move_eff,                                   # 17. Move efficiency (%)
-            vo_cm,                                      # 18. Vert Osc (cm)
-            gct,                                        # 19. GCT (ms) [已修復]
-            activity.get('activityType', {}).get('typeKey', 'run'), # 20. Activity Type
-            steps                                       # 21. Total Steps
+            date,                                       # A
+            activity.get('activityName', 'Run'),        # B
+            round(dist_m / 1000, 2),                    # C
+            format_to_time_string(dur_s),               # D
+            format_pace_string(dist_m, dur_s),          # E
+            activity.get('averageHR', 0) or 0,          # F
+            activity.get('maxHR', 0) or 0,              # G
+            activity.get('calories', 0) or 0,           # H
+            round(activity.get('averageRunningCadenceInStepsPerMinute', 0), 0), # I
+            round(activity.get('aerobicTrainingEffect', 0), 1),     # J
+            round(activity.get('anaerobicTrainingEffect', 0), 1),   # K
+            int(activity.get('elevationGain', 0) or 0), # L
+            pwr_avg,                                    # M
+            pwr_max,                                    # N
+            pwr_norm,                                   # O
+            step_m,                                     # P
+            move_eff,                                   # Q: Move Efficiency
+            vo_cm,                                      # R
+            gct,                                        # S
+            activity.get('activityType', {}).get('typeKey', 'run'), # T
+            steps                                       # U
         ]
         rows_to_insert.append(row)
 
     if rows_to_insert:
         sheet.insert_rows(rows_to_insert, 2)
-        print(f"✅ 成功同步 {len(rows_to_insert)} 筆資料 (格式已優化)")
+        print(f"✅ 成功同步 {len(rows_to_insert)} 筆資料 (含移動效率)")
     else:
         print("✓ 資料已是最新")
 
