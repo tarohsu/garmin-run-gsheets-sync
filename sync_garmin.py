@@ -3,19 +3,13 @@ import json
 from garminconnect import Garmin
 from google.oauth2.service_account import Credentials
 import gspread
-from datetime import datetime, timedelta
+from datetime import datetime
 
-# Load environment variables
-if os.path.exists('.env'):
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-    except ImportError:
-        pass
-
+# 格式化時間：秒轉分鐘
 def format_duration(seconds):
     return round(seconds / 60, 2) if seconds else 0
 
+# 格式化配速：秒/公尺轉分鐘/公里
 def format_pace(distance_meters, duration_seconds):
     if not distance_meters or not duration_seconds:
         return 0
@@ -24,44 +18,42 @@ def format_pace(distance_meters, duration_seconds):
     return round(pace_seconds / 60, 2)
 
 def main():
-    print("Starting Garmin running activities sync...")
+    print("🚀 Starting Professional Garmin Sync...")
     
+    # 1. 取得環境變數 (GitHub Secrets)
     garmin_email = os.environ.get('GARMIN_EMAIL')
     garmin_password = os.environ.get('GARMIN_PASSWORD')
     google_creds_json = os.environ.get('GOOGLE_CREDENTIALS')
     sheet_id = os.environ.get('SHEET_ID')
     
     if not all([garmin_email, garmin_password, google_creds_json, sheet_id]):
-        print("❌ Missing required environment variables")
+        print("❌ 錯誤：缺少必要的環境變數 (Secrets)")
         return
     
-    # Connect to Garmin
-    print("Connecting to Garmin...")
+    # 2. 登入 Garmin
+    print("🔗 Connecting to Garmin...")
     try:
         garmin = Garmin(garmin_email, garmin_password)
         garmin.login()
-        print("✅ Connected to Garmin")
+        print("✅ Garmin 登入成功")
     except Exception as e:
-        print(f"❌ Failed to connect to Garmin: {e}")
+        print(f"❌ Garmin 登入失敗: {e}")
         return
     
-    # Get recent activities (抓取最近 100 筆，確保數據更完整)
-    print("Fetching activities...")
+    # 3. 抓取活動 (設定 100 筆，確保歷史資料完整)
     try:
-        activities = garmin.get_activities(0, 100) 
-        print(f"Found {len(activities)} total activities")
+        activities = garmin.get_activities(0, 100)
+        running_activities = [
+            a for a in activities 
+            if a.get('activityType', {}).get('typeKey', '').lower() in ['running', 'treadmill_running', 'trail_running']
+        ]
+        print(f"📦 找到 {len(running_activities)} 筆跑步活動")
     except Exception as e:
-        print(f"❌ Failed to fetch activities: {e}")
+        print(f"❌ 無法取得活動: {e}")
         return
     
-    running_activities = [
-        activity for activity in activities 
-        if activity.get('activityType', {}).get('typeKey', '').lower() in ['running', 'treadmill_running', 'trail_running']
-    ]
-    
-    print(f"Found {len(running_activities)} running activities")
-    
-    # Connect to Google Sheets
+    # 4. 連結 Google Sheets
+    print("📊 Connecting to Google Sheets...")
     try:
         creds_dict = json.loads(google_creds_json)
         creds = Credentials.from_service_account_info(
@@ -69,72 +61,81 @@ def main():
             scopes=['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
         )
         client = gspread.authorize(creds)
-        # 使用你剛改好的檔名
+        # 開啟試算表與指定分頁
         sheet = client.open("Garmin Data").worksheet("Garmin Data")
-        print("✅ Connected to Google Sheets")
+        print("✅ Google Sheets 連結成功")
     except Exception as e:
-        print(f"❌ Failed to connect to Google Sheets: {e}")
+        print(f"❌ Google Sheets 連結失敗: {e}")
         return
     
-    try:
-        existing_data = sheet.get_all_values()
-        existing_dates = {row[0] for row in existing_data[1:] if row}
-        print(f"Found {len(existing_dates)} existing entries")
-    except Exception as e:
-        existing_dates = set()
-
+    # 5. 取得現有日期避免重複
+    existing_rows = sheet.get_all_values()
+    existing_dates = {row[0] for row in existing_rows[1:] if row}
+    
+    # 6. 開始處理資料 (由舊到新排序)
     new_entries = 0
-    # 按照時間由舊到新排序，確保寫入順序正確
     for activity in reversed(running_activities):
+        activity_date = activity.get('startTimeLocal', '')[:10]
+        
+        # 跳過已存在的日期
+        if activity_date in existing_dates:
+            continue
+            
         try:
-            activity_date = activity.get('startTimeLocal', '')[:10]
+            # --- 核心數據 ---
+            dist_m = activity.get('distance', 0)
+            dur_s = activity.get('duration', 0)
             
-            if activity_date in existing_dates:
-                continue
+            # --- 進階數據提取 (加入備用 Key 與單位換算) ---
             
-            # 提取基礎指標
-            distance_meters = activity.get('distance', 0)
-            duration_seconds = activity.get('duration', 0)
+            # 訓練效果：修正浮點數 4.19999...
+            aerobic_te = round(activity.get('aerobicTrainingEffect', 0), 1)
+            anaerobic_te = round(activity.get('anaerobicTrainingEffect', 0), 1)
             
-            # --- 提取進階指標 ---
-            aerobic_te = activity.get('aerobicTrainingEffect', 0)
-            anaerobic_te = activity.get('anaerobicTrainingEffect', 0)
-            # 步幅單位通常是公分，轉成公尺
-            avg_step_length = round(activity.get('avgStepLength', 0) / 100, 2) if activity.get('avgStepLength') else 0
-            # 跑步功率
-            avg_power = activity.get('avgRunningPower', 0)
-            # 平均溫度
-            avg_temp = activity.get('avgTemperature', 0)
+            # 步幅：偵測單位 (Garmin 有時傳公釐 mm，有時傳公分 cm)
+            raw_step = activity.get('avgStepLength') or activity.get('averageStepLength') or 0
+            if raw_step > 500: # 可能是公釐 (如 1050mm = 1.05m)
+                step_len = round(raw_step / 1000, 2)
+            elif raw_step > 10: # 可能是公分 (如 105cm = 1.05m)
+                step_len = round(raw_step / 100, 2)
+            else:
+                step_len = round(raw_step, 2)
+                
+            # 跑步功率：檢查多個可能路徑
+            avg_pwr = activity.get('avgRunningPower') or activity.get('averageRunningPower') or 0
             
-            row = [
-                activity_date,
-                activity.get('activityName', 'Run'),
-                round(distance_meters / 1000, 2),
-                format_duration(duration_seconds),
-                format_pace(distance_meters, duration_seconds),
-                activity.get('averageHR', 0) or 0,
-                activity.get('maxHR', 0) or 0,
-                activity.get('calories', 0) or 0,
-                activity.get('averageRunningCadenceInStepsPerMinute', 0) or 0,
-                round(activity.get('elevationGain', 0), 1) if activity.get('elevationGain') else 0,
-                activity.get('activityType', {}).get('typeKey', 'running'),
-                # 新增欄位
-                aerobic_te,
-                anaerobic_te,
-                avg_step_length,
-                avg_power,
-                avg_temp
+            # 溫度
+            avg_temp = activity.get('avgTemperature') or activity.get('averageTemperature') or 0
+            
+            # 依照試算表欄位順序組成 Row
+            row_data = [
+                activity_date,                                      # A: 日期
+                activity.get('activityName', 'Run'),                # B: 標題
+                round(dist_m / 1000, 2),                            # C: 距離(km)
+                format_duration(dur_s),                             # D: 時間(min)
+                format_pace(dist_m, dur_s),                         # E: 平均配速
+                activity.get('averageHR', 0) or 0,                  # F: 平均心率
+                activity.get('maxHR', 0) or 0,                      # G: 最大心率
+                activity.get('calories', 0) or 0,                   # H: 卡路里
+                activity.get('averageRunningCadenceInStepsPerMinute', 0) or 0, # I: 步頻
+                round(activity.get('elevationGain', 0), 1),         # J: 總爬升
+                activity.get('activityType', {}).get('typeKey', 'running'), # K: 類型
+                aerobic_te,                                         # L: Aerobic TE
+                anaerobic_te,                                       # M: Anaerobic TE
+                step_len,                                           # N: Step Length (m)
+                avg_pwr,                                            # O: Avg Power (W)
+                avg_temp                                            # P: Avg Temp (C)
             ]
             
-            sheet.append_row(row)
-            print(f"✅ Added: {activity_date} ({row[2]} km)")
+            sheet.append_row(row_data)
+            print(f"✅ Added: {activity_date} - {dist_m/1000:.2f}km (TE: {aerobic_te})")
             new_entries += 1
             
         except Exception as e:
-            print(f"❌ Error processing activity: {e}")
+            print(f"⚠️ 跳過 {activity_date} 資料處理錯誤: {e}")
             continue
-    
-    print(f"\n🎉 Sync Complete! Added {new_entries} new activities.")
+
+    print(f"\n✨ 同步完成！新增了 {new_entries} 筆紀錄。")
 
 if __name__ == "__main__":
     main()
