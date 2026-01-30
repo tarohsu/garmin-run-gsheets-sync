@@ -3,13 +3,10 @@ import json
 from garminconnect import Garmin
 from google.oauth2.service_account import Credentials
 import gspread
-from datetime import datetime
 
-# 格式化時間：秒轉分鐘
 def format_duration(seconds):
     return round(seconds / 60, 2) if seconds else 0
 
-# 格式化配速：秒/公尺轉分鐘/公里
 def format_pace(distance_meters, duration_seconds):
     if not distance_meters or not duration_seconds:
         return 0
@@ -18,124 +15,95 @@ def format_pace(distance_meters, duration_seconds):
     return round(pace_seconds / 60, 2)
 
 def main():
-    print("🚀 Starting Professional Garmin Sync...")
+    print("🚀 Starting Professional Garmin Sync (Newest First)...")
     
-    # 1. 取得環境變數 (GitHub Secrets)
     garmin_email = os.environ.get('GARMIN_EMAIL')
     garmin_password = os.environ.get('GARMIN_PASSWORD')
     google_creds_json = os.environ.get('GOOGLE_CREDENTIALS')
     sheet_id = os.environ.get('SHEET_ID')
     
     if not all([garmin_email, garmin_password, google_creds_json, sheet_id]):
-        print("❌ 錯誤：缺少必要的環境變數 (Secrets)")
+        print("❌ 錯誤：缺少 Secrets 設定")
         return
     
-    # 2. 登入 Garmin
-    print("🔗 Connecting to Garmin...")
+    # 連結 Garmin
     try:
         garmin = Garmin(garmin_email, garmin_password)
         garmin.login()
-        print("✅ Garmin 登入成功")
-    except Exception as e:
-        print(f"❌ Garmin 登入失敗: {e}")
-        return
-    
-    # 3. 抓取活動 (設定 100 筆，確保歷史資料完整)
-    try:
         activities = garmin.get_activities(0, 100)
         running_activities = [
             a for a in activities 
             if a.get('activityType', {}).get('typeKey', '').lower() in ['running', 'treadmill_running', 'trail_running']
         ]
-        print(f"📦 找到 {len(running_activities)} 筆跑步活動")
+        print(f"✅ 成功抓取 {len(running_activities)} 筆活動")
     except Exception as e:
-        print(f"❌ 無法取得活動: {e}")
+        print(f"❌ Garmin 錯誤: {e}")
         return
     
-    # 4. 連結 Google Sheets
-    print("📊 Connecting to Google Sheets...")
+    # 連結 Google Sheets
     try:
-        creds_dict = json.loads(google_creds_json)
         creds = Credentials.from_service_account_info(
-            creds_dict,
+            json.loads(google_creds_json),
             scopes=['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
         )
         client = gspread.authorize(creds)
-        # 開啟試算表與指定分頁
         sheet = client.open("Garmin Data").worksheet("Garmin Data")
-        print("✅ Google Sheets 連結成功")
     except Exception as e:
-        print(f"❌ Google Sheets 連結失敗: {e}")
+        print(f"❌ Sheets 錯誤: {e}")
         return
     
-    # 5. 取得現有日期避免重複
+    # 取得現有日期
     existing_rows = sheet.get_all_values()
     existing_dates = {row[0] for row in existing_rows[1:] if row}
     
-    # 6. 開始處理資料 (由舊到新排序)
+    # 處理資料 (注意：不使用 reversed，因為 API 回傳本身就是由新到舊)
     new_entries = 0
-    for activity in reversed(running_activities):
+    for activity in running_activities:
         activity_date = activity.get('startTimeLocal', '')[:10]
         
-        # 跳過已存在的日期
         if activity_date in existing_dates:
             continue
             
         try:
-            # --- 核心數據 ---
             dist_m = activity.get('distance', 0)
             dur_s = activity.get('duration', 0)
             
-            # --- 進階數據提取 (加入備用 Key 與單位換算) ---
-            
-            # 訓練效果：修正浮點數 4.19999...
+            # 格式化數據
             aerobic_te = round(activity.get('aerobicTrainingEffect', 0), 1)
             anaerobic_te = round(activity.get('anaerobicTrainingEffect', 0), 1)
             
-            # 步幅：偵測單位 (Garmin 有時傳公釐 mm，有時傳公分 cm)
             raw_step = activity.get('avgStepLength') or activity.get('averageStepLength') or 0
-            if raw_step > 500: # 可能是公釐 (如 1050mm = 1.05m)
-                step_len = round(raw_step / 1000, 2)
-            elif raw_step > 10: # 可能是公分 (如 105cm = 1.05m)
-                step_len = round(raw_step / 100, 2)
-            else:
-                step_len = round(raw_step, 2)
+            step_len = round(raw_step / 100, 2) if raw_step > 10 else round(raw_step, 2)
                 
-            # 跑步功率：檢查多個可能路徑
-            avg_pwr = activity.get('avgRunningPower') or activity.get('averageRunningPower') or 0
-            
-            # 溫度
-            avg_temp = activity.get('avgTemperature') or activity.get('averageTemperature') or 0
-            
-            # 依照試算表欄位順序組成 Row
             row_data = [
-                activity_date,                                      # A: 日期
-                activity.get('activityName', 'Run'),                # B: 標題
-                round(dist_m / 1000, 2),                            # C: 距離(km)
-                format_duration(dur_s),                             # D: 時間(min)
-                format_pace(dist_m, dur_s),                         # E: 平均配速
-                activity.get('averageHR', 0) or 0,                  # F: 平均心率
-                activity.get('maxHR', 0) or 0,                      # G: 最大心率
-                activity.get('calories', 0) or 0,                   # H: 卡路里
-                activity.get('averageRunningCadenceInStepsPerMinute', 0) or 0, # I: 步頻
-                round(activity.get('elevationGain', 0), 1),         # J: 總爬升
-                activity.get('activityType', {}).get('typeKey', 'running'), # K: 類型
-                aerobic_te,                                         # L: Aerobic TE
-                anaerobic_te,                                       # M: Anaerobic TE
-                step_len,                                           # N: Step Length (m)
-                avg_pwr,                                            # O: Avg Power (W)
-                avg_temp                                            # P: Avg Temp (C)
+                activity_date,
+                activity.get('activityName', 'Run'),
+                round(dist_m / 1000, 2),
+                format_duration(dur_s),
+                format_pace(dist_m, dur_s),
+                activity.get('averageHR', 0) or 0,
+                activity.get('maxHR', 0) or 0,
+                activity.get('calories', 0) or 0,
+                activity.get('averageRunningCadenceInStepsPerMinute', 0) or 0,
+                round(activity.get('elevationGain', 0), 1),
+                activity.get('activityType', {}).get('typeKey', 'running'),
+                aerobic_te,
+                anaerobic_te,
+                step_len,
+                activity.get('avgRunningPower') or 0,
+                activity.get('avgTemperature') or 0
             ]
             
-            sheet.append_row(row_data)
-            print(f"✅ Added: {activity_date} - {dist_m/1000:.2f}km (TE: {aerobic_te})")
+            # 關鍵修改：將資料插入到第 2 列 (標題列下方)
+            sheet.insert_row(row_data, 2)
+            print(f"新增最新資料: {activity_date}")
             new_entries += 1
             
         except Exception as e:
-            print(f"⚠️ 跳過 {activity_date} 資料處理錯誤: {e}")
+            print(f"⚠️ 略過 {activity_date}: {e}")
             continue
 
-    print(f"\n✨ 同步完成！新增了 {new_entries} 筆紀錄。")
+    print(f"\n✨ 同步完成！{new_entries} 筆新紀錄已置頂。")
 
 if __name__ == "__main__":
     main()
