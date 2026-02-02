@@ -1,9 +1,12 @@
 import os
 import json
+import time
+from datetime import datetime, timedelta
 from garminconnect import Garmin
 from google.oauth2.service_account import Credentials
 import gspread
 
+# --- 輔助函式 ---
 def format_to_time_string(seconds):
     if not seconds: return "0:00"
     seconds = int(round(seconds))
@@ -12,17 +15,26 @@ def format_to_time_string(seconds):
 
 def format_pace_string(distance_meters, duration_seconds):
     if not distance_meters or not duration_seconds: return "0:00"
+    if distance_meters <= 0: return "0:00"
     pace_seconds = int(round(duration_seconds / (distance_meters / 1000)))
     return f"{pace_seconds // 60}:{pace_seconds % 60:02d}"
 
 def main():
-    print("🚀 Running Logic-Optimized Sync...")
-    garmin_email, garmin_password = os.environ.get('GARMIN_EMAIL'), os.environ.get('GARMIN_PASSWORD')
-    google_creds_json, sheet_id = os.environ.get('GOOGLE_CREDENTIALS'), os.environ.get('SHEET_ID')
+    print("🚀 啟動穩定同步 (近 3 個月數據，移除呼吸率與流汗量)...")
+    garmin_email = os.environ.get('GARMIN_EMAIL')
+    garmin_password = os.environ.get('GARMIN_PASSWORD')
+    google_creds_json = os.environ.get('GOOGLE_CREDENTIALS')
+    sheet_id = os.environ.get('SHEET_ID')
     
     garmin = Garmin(garmin_email, garmin_password)
     garmin.login()
-    activities = garmin.get_activities(0, 50)
+    
+    # 增加抓取筆數以涵蓋 3 個月 (依照你的紀錄，150 筆非常足夠)
+    activities = garmin.get_activities(0, 150)
+    
+    # 設定 3 個月 (90天) 的過濾線
+    cutoff_date = datetime.now() - timedelta(days=90)
+    print(f"📅 鎖定同步範圍：{cutoff_date.strftime('%Y-%m-%d')} 至今")
     
     creds = Credentials.from_service_account_info(json.loads(google_creds_json),
         scopes=['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive'])
@@ -30,28 +42,41 @@ def main():
     sheet = client.open("Garmin Data").worksheet("Garmin Data")
     
     existing_dates = {row[0] for row in sheet.get_all_values()[1:] if row}
-    running_activities = [a for a in activities if a.get('activityType', {}).get('typeKey', '').lower() in ['running', 'treadmill_running', 'trail_running']]
+    
+    # 過濾跑步活動與日期
+    target_activities = []
+    for a in activities:
+        start_time_str = a.get('startTimeLocal', '')
+        if not start_time_str: continue
+        
+        act_date = datetime.strptime(start_time_str[:10], '%Y-%m-%d')
+        if act_date < cutoff_date: continue
+        
+        if a.get('activityType', {}).get('typeKey', '').lower() in ['running', 'treadmill_running', 'trail_running']:
+            if start_time_str[:10] not in existing_dates:
+                target_activities.append(a)
+    
+    print(f"📦 發現 {len(target_activities)} 筆新跑步資料...")
     
     rows_to_insert = []
     
-    for activity in running_activities:
+    for activity in target_activities:
         date = activity.get('startTimeLocal', '')[:10]
-        if date in existing_dates: continue
-            
+        
         # --- 數據提取 ---
         dist_m = activity.get('distance', 0)
         dur_s = activity.get('duration', 0)
         
-        # 步幅
+        # 步幅 (Stride)
         stride_raw = activity.get('avgStrideLength') or activity.get('averageStepLength') or 0
         step_m = round(stride_raw / 100, 2) if stride_raw > 10 else round(stride_raw, 2)
         
-        # 功率
+        # 功率 (Power)
         pwr_avg = int(activity.get('avgPower', 0) or activity.get('avgRunningPower', 0) or 0)
         pwr_max = int(activity.get('maxPower', 0) or 0)
         pwr_norm = int(activity.get('normPower', 0) or 0)
         
-        # 跑姿
+        # 跑姿 (Dynamics)
         gct = int(round(activity.get('avgGroundContactTime') or 0))
         vo_raw = activity.get('avgVerticalOscillation') or 0
         vo_cm = round(vo_raw / 10, 1) if vo_raw > 20 else round(vo_raw, 1)
@@ -62,64 +87,52 @@ def main():
             vr = (vo_raw / (stride_raw * 10)) * 100
         move_eff = round(vr, 1)
 
-        # GCT Balance
-        gct_bal_left = activity.get('avgGroundContactBalance')
+        # 觸地平衡
+        gct_bal_left = activity.get('avgGroundContactBalance') or activity.get('avgGroundContactTimeBalance')
         if gct_bal_left:
+            if gct_bal_left > 100: gct_bal_left /= 100
             gct_bal_str = f"{gct_bal_left}% L / {round(100 - gct_bal_left, 1)}% R"
         else:
             gct_bal_str = "--"
 
-        # 其他
-        min_elev = int(activity.get('minElevation') or 0)
-        max_elev = int(activity.get('maxElevation') or 0)
-        resp_rate = int(activity.get('avgRespirationRate') or 0)
-        sweat = int(activity.get('estimatedSweatLoss') or 0)
+        # 其他 (移除 resp_rate 與 sweat)
         vo2 = int(activity.get('vO2MaxValue') or 0)
         steps = activity.get('steps', 0)
+        min_elev = int(activity.get('minElevation') or 0)
+        max_elev = int(activity.get('maxElevation') or 0)
 
-        # --- [優化邏輯] 重新排序 ---
+        # --- [優化邏輯] 重新排列順序 (移除呼吸率與流汗量，共 24 欄) ---
         row = [
-            # 1. 基本資訊 (Result)
             date,                                       # A: 日期
             activity.get('activityName', 'Run'),        # B: 名稱
             round(dist_m / 1000, 2),                    # C: 距離
             format_to_time_string(dur_s),               # D: 時間
             format_pace_string(dist_m, dur_s),          # E: 配速
-            
-            # 2. 體能引擎 (Engine)
-            vo2,                                        # F: VO2 Max (移前!)
+            vo2,                                        # F: VO2 Max
             activity.get('averageHR', 0) or 0,          # G: 平均心率
             activity.get('maxHR', 0) or 0,              # H: 最大心率
-            resp_rate,                                  # I: 呼吸率
-            round(activity.get('aerobicTrainingEffect', 0), 1),     # J: 有氧 TE
-            round(activity.get('anaerobicTrainingEffect', 0), 1),   # K: 無氧 TE
-            
-            # 3. 跑步技術 (Technique) - Sub 100 關鍵區
-            round(activity.get('averageRunningCadenceInStepsPerMinute', 0), 0), # L: 步頻
-            step_m,                                     # M: 步幅
-            move_eff,                                   # N: 移動效率
-            vo_cm,                                      # O: 垂直振幅
-            gct,                                        # P: 觸地時間
-            gct_bal_str,                                # Q: 觸地平衡
-            
-            # 4. 功率輸出 (Power)
-            pwr_norm,                                   # R: NP (標準化優先)
-            pwr_avg,                                    # S: 平均功率
-            pwr_max,                                    # T: 最大功率
-            
-            # 5. 環境與消耗 (Context)
-            int(activity.get('elevationGain', 0) or 0), # U: 總爬升
-            min_elev,                                   # V: 最低海拔
-            max_elev,                                   # W: 最高海拔
-            steps,                                      # X: 總步數
-            sweat,                                      # Y: 流汗量
-            activity.get('calories', 0) or 0            # Z: 卡路里
+            round(activity.get('aerobicTrainingEffect', 0), 1),     # I: 有氧 TE
+            round(activity.get('anaerobicTrainingEffect', 0), 1),   # J: 無氧 TE
+            round(activity.get('averageRunningCadenceInStepsPerMinute', 0), 0), # K: 平均步頻
+            step_m,                                     # L: 平均步幅 (m)
+            move_eff,                                   # M: 移動效率 (%)
+            vo_cm,                                      # N: 垂直振幅 (cm)
+            gct,                                        # O: 觸地時間 (ms)
+            gct_bal_str,                                # P: 觸地平衡
+            pwr_norm,                                   # Q: 標準化功率 (NP)
+            pwr_avg,                                    # R: 平均功率 (W)
+            pwr_max,                                    # S: 最大功率 (W)
+            int(activity.get('elevationGain', 0) or 0), # T: 總爬升 (m)
+            min_elev,                                   # U: 最低海拔 (m)
+            max_elev,                                   # V: 最高海拔 (m)
+            steps,                                      # W: 總步數
+            activity.get('calories', 0) or 0            # X: 卡路里
         ]
         rows_to_insert.append(row)
 
     if rows_to_insert:
         sheet.insert_rows(rows_to_insert, 2)
-        print(f"✅ 成功同步 {len(rows_to_insert)} 筆資料 (邏輯排序版)")
+        print(f"✅ 成功同步 {len(rows_to_insert)} 筆資料至主表")
     else:
         print("✓ 資料已是最新")
 
