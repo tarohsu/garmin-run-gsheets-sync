@@ -6,7 +6,6 @@ from garminconnect import Garmin
 from google.oauth2.service_account import Credentials
 import gspread
 
-# --- 輔助函式 ---
 def format_to_time_string(seconds):
     if not seconds: return "0:00"
     seconds = int(round(seconds))
@@ -15,20 +14,13 @@ def format_to_time_string(seconds):
 
 def format_pace_string(distance_meters, duration_seconds):
     if not distance_meters or not duration_seconds: return "0:00"
+    # 避免除以零
+    if distance_meters <= 0: return "0:00"
     pace_seconds = int(round(duration_seconds / (distance_meters / 1000)))
     return f"{pace_seconds // 60}:{pace_seconds % 60:02d}"
 
-def safe_get(data, *keys):
-    """安全地從巢狀字典中獲取數據"""
-    for key in keys:
-        if isinstance(data, dict):
-            data = data.get(key)
-        else:
-            return 0
-    return data if data is not None else 0
-
 def main():
-    print("🚀 啟動 FR965 旗艦全數據同步 (修復字串錯誤)...")
+    print("🚀 啟動 FR965 結構修正同步 (針對 summaryDTO 與 splitSummaries)...")
     
     # 1. 讀取環境變數
     garmin_email = os.environ.get('GARMIN_EMAIL')
@@ -61,9 +53,9 @@ def main():
         print("❌ 找不到 'Garmin Splits' 分頁")
         return
     
-    # 4. 鎖定近 3 個月活動
-    # 先抓清單摘要，用來篩選日期
-    summary_activities = garmin.get_activities(0, 100) 
+    # 4. 鎖定範圍 (先抓清單篩選日期)
+    # 擴大搜尋範圍以確保包含近3個月
+    summary_list = garmin.get_activities(0, 100)
     
     cutoff_date = datetime.now() - timedelta(days=90)
     print(f"📅 鎖定同步範圍：{cutoff_date.strftime('%Y-%m-%d')} 至今")
@@ -71,7 +63,7 @@ def main():
     existing_dates = {row[0] for row in sheet_main.get_all_values()[1:] if row}
     
     target_activities = []
-    for a in summary_activities:
+    for a in summary_list:
         start_time = a.get('startTimeLocal', '')
         if not start_time: continue
         
@@ -80,57 +72,54 @@ def main():
         
         # 只抓跑步
         if a.get('activityType', {}).get('typeKey', '').lower() in ['running', 'treadmill_running', 'trail_running']:
-            # 檢查是否已存在 (避免重複抓取浪費時間)
             if start_time[:10] not in existing_dates:
                 target_activities.append(a)
 
-    print(f"📦 發現 {len(target_activities)} 筆新資料需要同步 (將逐筆抓取詳情)...")
+    print(f"📦 發現 {len(target_activities)} 筆新資料 (將進入深層結構提取)...")
 
     rows_main = []
     rows_splits = []
     
-    # 5. 逐筆抓取「全數據」(Full Activity Data)
-    for index, summary in enumerate(target_activities):
-        activity_id = summary.get('activityId')
-        date = summary.get('startTimeLocal', '')[:10]
-        name = summary.get('activityName', 'Run')
+    # 5. 逐筆抓取詳情
+    for index, item in enumerate(target_activities):
+        activity_id = item.get('activityId')
+        date = item.get('startTimeLocal', '')[:10]
+        name = item.get('activityName', 'Run')
         
-        print(f"🔄 [{index+1}/{len(target_activities)}] 正在下載詳情: {date} - {name}...")
+        print(f"🔄 [{index+1}/{len(target_activities)}] 下載與解析: {date} - {name}...")
         
         try:
-            # [關鍵修正] 使用 get_activity 而不是 get_activity_details
-            # 這會回傳最完整的資料包
+            # 獲取完整數據
             full_data = garmin.get_activity(activity_id)
-            
-            # [防呆] 如果回傳的是字串，強制轉 JSON
             if isinstance(full_data, str):
                 full_data = json.loads(full_data)
 
-            # --- A. 提取主表數據 (從 full_data 提取更精準) ---
-            # 摘要資訊通常在 'summaryDTO' 或直接在根目錄
-            # 為了保險，我們優先讀取根目錄，若無則讀取 summary
+            # === 關鍵修正：進入 summaryDTO 抓取數據 ===
+            # 如果 summaryDTO 不存在，退而求其次用 full_data (有些舊資料可能結構不同)
+            summary = full_data.get('summaryDTO') or full_data
             
-            dist_m = full_data.get('distance', 0)
-            dur_s = full_data.get('duration', 0)
+            dist_m = summary.get('distance', 0)
+            dur_s = summary.get('duration', 0)
             
+            # 如果距離為0，可能是資料異常，但我們還是照實記錄
+            if dist_m == 0:
+                print(f"⚠️ 注意: {date} 距離為 0")
+
             # 進階指標
-            stride = full_data.get('avgStrideLength') or 0
+            stride = summary.get('avgStrideLength') or 0
             step_m = round(stride / 100, 2) if stride > 10 else round(stride, 2)
             
-            # 跑姿
-            gct = int(round(full_data.get('avgGroundContactTime') or 0))
-            vo = full_data.get('avgVerticalOscillation') or 0
+            gct = int(round(summary.get('avgGroundContactTime') or 0))
+            vo = summary.get('avgVerticalOscillation') or 0
             vo_cm = round(vo / 10, 1) if vo > 20 else round(vo, 1)
             
-            # 效率
-            vr = full_data.get('avgVerticalRatio') or 0
+            vr = summary.get('avgVerticalRatio') or 0
             if vr == 0 and stride > 0 and vo > 0:
                 vr = (vo / (stride * 10)) * 100
             move_eff = round(vr, 1)
 
-            # [觸地平衡]
-            # 注意: 這是硬體限制，若無數據就是無數據
-            gct_bal = full_data.get('avgGroundContactBalance')
+            # 觸地平衡 (沒有就顯示 --)
+            gct_bal = summary.get('avgGroundContactBalance')
             if gct_bal:
                 if gct_bal > 100: gct_bal /= 100
                 gct_bal_str = f"{gct_bal}% L / {round(100 - gct_bal, 1)}% R"
@@ -138,29 +127,29 @@ def main():
                 gct_bal_str = "--"
 
             # 功率
-            pwr_avg = int(full_data.get('avgPower', 0) or full_data.get('avgRunningPower', 0) or 0)
-            pwr_max = int(full_data.get('maxPower', 0) or 0)
-            pwr_norm = int(full_data.get('normPower', 0) or 0)
+            pwr_avg = int(summary.get('avgPower', 0) or summary.get('avgRunningPower', 0) or 0)
+            pwr_max = int(summary.get('maxPower', 0) or 0)
+            pwr_norm = int(summary.get('normPower', 0) or 0)
             
-            # [修復] 流汗量與呼吸率 (從全數據抓取)
-            sweat = int(full_data.get('totalSweatLoss') or full_data.get('sweatLoss') or 0)
-            resp_rate = int(full_data.get('avgRespirationRate') or 0)
+            # 流汗與呼吸 (若無則 0)
+            sweat = int(summary.get('totalSweatLoss') or summary.get('sweatLoss') or 0)
+            resp_rate = int(summary.get('avgRespirationRate') or 0)
             
             # 其他
-            steps = full_data.get('steps', 0)
-            min_elev = int(full_data.get('minElevation') or 0)
-            max_elev = int(full_data.get('maxElevation') or 0)
-            vo2 = int(full_data.get('vO2MaxValue') or 0)
-            cal = int(full_data.get('calories') or 0)
+            steps = summary.get('steps', 0)
+            min_elev = int(summary.get('minElevation') or 0)
+            max_elev = int(summary.get('maxElevation') or 0)
+            vo2 = int(summary.get('vO2MaxValue') or 0)
+            cal = int(summary.get('calories') or 0)
             
-            hr = full_data.get('averageHR') or 0
-            max_hr = full_data.get('maxHR') or 0
-            cadence = round(full_data.get('averageRunningCadenceInStepsPerMinute', 0), 0)
-            aerobic = round(full_data.get('aerobicTrainingEffect', 0), 1)
-            anaerobic = round(full_data.get('anaerobicTrainingEffect', 0), 1)
-            elev_gain = int(full_data.get('elevationGain', 0) or 0)
+            hr = summary.get('averageHR') or 0
+            max_hr = summary.get('maxHR') or 0
+            cadence = round(summary.get('averageRunningCadenceInStepsPerMinute', 0), 0)
+            aerobic = round(summary.get('aerobicTrainingEffect', 0), 1)
+            anaerobic = round(summary.get('anaerobicTrainingEffect', 0), 1)
+            elev_gain = int(summary.get('elevationGain', 0) or 0)
 
-            # 主表資料列
+            # 26 欄
             row_main = [
                 date, name, round(dist_m / 1000, 2), format_to_time_string(dur_s), format_pace_string(dist_m, dur_s),
                 vo2, hr, max_hr, resp_rate, aerobic, anaerobic,
@@ -170,20 +159,22 @@ def main():
             ]
             rows_main.append(row_main)
 
-            # --- B. 提取分段數據 (Splits/Laps) ---
-            # 在全數據模式下，laps 通常位於 'laps' 鍵中
-            laps_data = full_data.get('laps', [])
+            # === 關鍵修正：進入 splitSummaries 抓分段 ===
+            # Log 顯示這裡有東西
+            splits_list = full_data.get('splitSummaries', [])
             
-            # 如果是字串 (雖然前面轉過了，保險起見)
-            if isinstance(laps_data, str):
-                laps_data = json.loads(laps_data)
-                
-            if laps_data:
-                for i, split in enumerate(laps_data):
+            if splits_list:
+                for i, split in enumerate(splits_list):
+                    # 有時候 splits 裡的 key 也可能不一樣，我們小心處理
                     s_dist = split.get('distance', 0)
                     s_dur = split.get('duration', 0)
+                    
+                    # 避免 0 距離的分段 (例如休息段有時會很怪)
+                    # if s_dist == 0: continue 
+                    
                     s_stride = split.get('avgStrideLength') or 0
                     s_step_m = round(s_stride / 100, 2) if s_stride > 10 else round(s_stride, 2)
+                    
                     s_pwr = int(split.get('avgPower') or split.get('avgRunningPower') or 0)
                     s_elev = int(split.get('elevationGain') or 0)
                     
@@ -196,29 +187,24 @@ def main():
                     ]
                     rows_splits.append(row_split)
             else:
-                print(f"⚠️ {date} 無分段資料 (Raw Keys: {list(full_data.keys())})")
+                # 這次不應該再發生了，除非真的沒分段
+                print(f"⚠️ {date} 依然無分段 (Key 'splitSummaries' is empty)")
 
-            # 禮貌性延遲，避免大量請求被擋
-            time.sleep(1)
+            time.sleep(1) # 禮貌性延遲
 
         except Exception as e:
             print(f"❌ 處理 {date} 失敗: {e}")
-            # 發生錯誤時，印出類型以利除錯
-            # print(f"DEBUG Type: {type(full_data)}")
 
-    # 6. 寫入 Google Sheets
+    # 6. 寫入
     if rows_main:
-        # 為了保持時間順序，我們將新抓取的資料反轉 (因為 target_activities 是新到舊，寫入時我們希望保持這順序插在最上面)
-        # sheet_main.insert_rows(rows_main, 2)
-        # 其實 insert_rows 會把整塊插進去，所以不需要特別反轉，直接插在 Row 2 即可
         sheet_main.insert_rows(rows_main, 2)
-        print(f"✅ 主表同步完成: 新增 {len(rows_main)} 筆")
+        print(f"✅ 主表同步: {len(rows_main)} 筆 (數值修正完成)")
     
     if rows_splits:
         sheet_splits.insert_rows(rows_splits, 2)
-        print(f"✅ 分段同步完成: 新增 {len(rows_splits)} 圈數據")
+        print(f"✅ 分段同步: {len(rows_splits)} 圈 (抓取 splitSummaries)")
 
     if not rows_main:
-        print("✓ 所有資料已是最新")
+        print("✓ 資料已是最新")
 
 if __name__ == "__main__": main()
