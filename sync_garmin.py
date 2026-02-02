@@ -18,11 +18,17 @@ def format_pace_string(distance_meters, duration_seconds):
 
 def main():
     print("🚀 啟動最終修正版同步 (修復分頁與空白欄位)...")
-    garmin_email, garmin_password = os.environ.get('GARMIN_EMAIL'), os.environ.get('GARMIN_PASSWORD')
-    google_creds_json, sheet_id = os.environ.get('SHEET_ID') # 注意: 有些人是設 SHEET_ID, 有些是 GOOGLE_SHEET_ID, 請確認
-    # 修正: 讀取 GOOGLE_CREDENTIALS
-    if not google_creds_json:
-        google_creds_json = os.environ.get('GOOGLE_CREDENTIALS')
+    
+    # --- [修正] 環境變數讀取方式 (分開讀取避免報錯) ---
+    garmin_email = os.environ.get('GARMIN_EMAIL')
+    garmin_password = os.environ.get('GARMIN_PASSWORD')
+    google_creds_json = os.environ.get('GOOGLE_CREDENTIALS')
+    sheet_id = os.environ.get('SHEET_ID')
+    
+    # 簡單檢查
+    if not all([garmin_email, garmin_password, google_creds_json, sheet_id]):
+        print("❌ 錯誤：缺少必要的環境變數 (Secrets)，請檢查 GitHub Settings。")
+        return
 
     garmin = Garmin(garmin_email, garmin_password)
     garmin.login()
@@ -75,15 +81,10 @@ def main():
             vr = (vo_raw / (stride_raw * 10)) * 100
         move_eff = round(vr, 1)
 
-        # [修復] 觸地平衡
-        # 嘗試多個 Key: avgGroundContactBalance, avgGroundContactTimeBalance
-        # 有些回傳 50.5, 有些回傳 5050 (需除以100)
+        # 觸地平衡
         gct_bal_raw = activity.get('avgGroundContactBalance') or activity.get('avgGroundContactTimeBalance')
         if gct_bal_raw:
-            # 如果數值大於 100 (例如 5050), 轉成 50.5
             if gct_bal_raw > 100: gct_bal_raw /= 100
-            
-            # Garmin 通常回傳的是 "左腳" 的百分比
             gct_bal_str = f"{gct_bal_raw}% L / {round(100 - gct_bal_raw, 1)}% R"
         else:
             gct_bal_str = "--"
@@ -93,7 +94,7 @@ def main():
         pwr_max = int(activity.get('maxPower', 0) or 0)
         pwr_norm = int(activity.get('normPower', 0) or 0)
         
-        # [修復] 流汗量
+        # 流汗量
         sweat = int(activity.get('estimatedSweatLoss') or activity.get('sweatLoss') or activity.get('totalSweatLoss') or 0)
 
         # 其他
@@ -104,7 +105,7 @@ def main():
         vo2 = int(activity.get('vO2MaxValue') or 0)
         cal = int(activity.get('calories') or 0)
 
-        # 26 欄 (已移除 '課表類型')
+        # 26 欄
         row_main = [
             date, activity_name, round(dist_m / 1000, 2), format_to_time_string(dur_s), format_pace_string(dist_m, dur_s), # A-E
             vo2, activity.get('averageHR', 0) or 0, activity.get('maxHR', 0) or 0, resp_rate, round(activity.get('aerobicTrainingEffect', 0), 1), round(activity.get('anaerobicTrainingEffect', 0), 1), # F-K
@@ -116,16 +117,11 @@ def main():
 
         # --- [分頁] 抓取詳細分圈數據 (Laps) ---
         try:
-            # 改用 get_activity_details，這包含了 laps, splits, metrics
+            # 改用 get_activity_details 確保抓得到 laps
             details = garmin.get_activity_details(activity_id)
             api_call_count += 1
             
-            # 優先找 'splits' (每公里)，如果沒有則找 'laps' (手動/自動計圈)
-            # 注意: 詳情裡的 key 可能是 'activityDetailMetrics' 或 'laps'
-            # 觀察 Garmin JSON 結構，通常 'laps' 比較穩
             splits_data = details.get('laps', [])
-            
-            # 如果 laps 也是空的，嘗試找 splits
             if not splits_data:
                 splits_data = details.get('splits', [])
 
@@ -134,14 +130,10 @@ def main():
                 s_dist = split.get('distance', 0)
                 s_dur = split.get('duration', 0)
                 
-                # 步幅
                 s_stride = split.get('avgStrideLength') or 0
                 s_step_m = round(s_stride / 100, 2) if s_stride > 10 else round(s_stride, 2)
                 
-                # 功率
                 s_pwr = int(split.get('avgPower') or split.get('avgRunningPower') or 0)
-                
-                # 爬升
                 s_elev = int(split.get('elevationGain') or 0)
 
                 row_split = [
@@ -154,7 +146,6 @@ def main():
                 rows_splits.append(row_split)
                 lap_count += 1
             
-            # 限流保護
             if api_call_count >= 10:
                 time.sleep(2)
                 api_call_count = 0
