@@ -2,7 +2,7 @@ name: Garmin to Google Sheets Sync
 
 on:
   schedule:
-    - cron: '*/30 * * * *'  # 修改處：設定為每 30 分鐘執行一次
+    - cron: '*/60 * * * *'  # 修改處：設定為每 30 分鐘執行一次
   workflow_dispatch:  # 保留手動觸發按鈕
 
 jobs:
